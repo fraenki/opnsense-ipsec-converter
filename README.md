@@ -10,7 +10,7 @@
 
 OPNsense introduced a new IPsec GUI and will end support for the legacy IPsec GUI in release 26.1.
 
-Migration from the old to the new GUI has to be done manually, which may be pretty time-consuming (and error-prone) task.
+Migration from the old to the new GUI has to be done manually, which may be a pretty time-consuming (and error-prone) task.
 
 This script tries to convert legacy IPsec configurations to the new format. It should work pretty well for simple configurations that rely (mostly) on default values. More complex configurations may required further adjustements to the script.
 
