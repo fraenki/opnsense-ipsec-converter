@@ -1,0 +1,4 @@
+.git/
+.*.sw[op]
+/tmp/
+.DS_Store
