@@ -5,6 +5,7 @@ import uuid
 from itertools import product
 import os
 import re
+import ipaddress
 
 # --- Configuration ---
 # Path to the original OPNsense configuration file
@@ -17,6 +18,31 @@ OUTPUT_CONFIG_PATH = 'config.new.xml'
 def get_text_from_element(element, tag, default=''):
     found = element.find(tag)
     return found.text if found is not None and found.text else default
+
+def get_interface_cidr(opnsense_root, interface_name):
+    """
+    Finds an interface by its logical name (e.g., 'lan', 'opt2') in the <interfaces>
+    section and calculates its network address in CIDR notation.
+    """
+    interfaces_elem = opnsense_root.find('interfaces')
+    if interfaces_elem is None:
+        return None
+
+    interface_elem = interfaces_elem.find(interface_name)
+    if interface_elem is None:
+        return None
+
+    ipaddr = get_text_from_element(interface_elem, 'ipaddr')
+    subnet = get_text_from_element(interface_elem, 'subnet')
+
+    if ipaddr and subnet:
+        try:
+            # Calculate the network address from the host IP and subnet mask
+            network = ipaddress.ip_network(f'{ipaddr}/{subnet}', strict=False)
+            return str(network)
+        except ValueError:
+            return None
+    return None
 
 def map_dh_group_to_modp(dhgroup):
     dh_map = {
@@ -69,6 +95,29 @@ def main():
     <hostname>firewall</hostname>
     <other><value/></other>
   </system>
+  <interfaces>
+    <wan>
+      <if>ix0</if>
+      <descr>WAN</descr>
+      <enable>1</enable>
+      <ipaddr>1.2.3.4</ipaddr>
+      <subnet>30</subnet>
+    </wan>
+    <lan>
+      <if>ix1</if>
+      <descr>LAN</descr>
+      <enable>1</enable>
+      <ipaddr>10.10.10.1</ipaddr>
+      <subnet>24</subnet>
+    </lan>
+    <opt2>
+      <if>ix0_vlan123</if>
+      <descr>VLAN123</descr>
+      <enable>1</enable>
+      <ipaddr>192.168.123.1</ipaddr>
+      <subnet>24</subnet>
+    </opt2>
+  </interfaces>
   <ipsec>
     <phase1>
       <ikeid>3</ikeid>
@@ -86,7 +135,7 @@ def main():
       <ikeid>3</ikeid><uniqid>5d541916220aa</uniqid><mode>tunnel</mode>
       <pfsgroup>16</pfsgroup><lifetime>3600</lifetime><descr>tunnel 1</descr>
       <protocol>esp</protocol>
-      <localid><type>network</type><address>10.11.0.0</address><netbits>24</netbits></localid>
+      <localid><type>opt2</type></localid>
       <remoteid><type>network</type><address>10.22.0.0</address><netbits>24</netbits></remoteid>
       <encryption-algorithm-option><name>aes256</name></encryption-algorithm-option>
       <hash-algorithm-option>hmac_sha256</hash-algorithm-option>
@@ -123,12 +172,15 @@ def main():
             f.write(original_xml_content)
         return
 
+    # Create root for the new pre-shared keys. This is temporary for building the new keys.
+    pre_shared_keys_elem = ET.Element('preSharedKeys')
+
     swanctl_root = get_or_create_sub_element(opnsense_root, 'Swanctl', {"version": "1.0.0"})
     connections_elem = get_or_create_sub_element(swanctl_root, 'Connections')
     children_elem = get_or_create_sub_element(swanctl_root, 'children')
     spds_elem = get_or_create_sub_element(swanctl_root, 'SPDs')
-    get_or_create_sub_element(swanctl_root, "locals")
-    get_or_create_sub_element(swanctl_root, "remotes")
+    locals_elem = get_or_create_sub_element(swanctl_root, "locals")
+    remotes_elem = get_or_create_sub_element(swanctl_root, "remotes")
     get_or_create_sub_element(swanctl_root, "Pools")
     get_or_create_sub_element(swanctl_root, "VTIs")
 
@@ -175,6 +227,63 @@ def main():
         ET.SubElement(conn, "keyingtries")
         ET.SubElement(conn, "description").text = get_text_from_element(p1, 'descr')
 
+        # Handle PSK migration for both IPsec and Swanctl sections.
+        auth_method = get_text_from_element(p1, 'authentication_method')
+        if auth_method == 'pre_shared_key':
+            psk = get_text_from_element(p1, 'pre-shared-key')
+            myid_type = get_text_from_element(p1, 'myid_type')
+            peerid_type = get_text_from_element(p1, 'peerid_type')
+            myid_data = get_text_from_element(p1, 'myid_data')
+            peerid_data = get_text_from_element(p1, 'peerid_data')
+            remote_gateway = get_text_from_element(p1, 'remote-gateway')
+
+            # Create the PreSharedKey entry for later insertion into the <IPsec> section.
+            if psk:
+                psk_uuid = str(uuid.uuid4())
+                psk_elem = ET.SubElement(pre_shared_keys_elem, "preSharedKey", {"uuid": psk_uuid})
+                ET.SubElement(psk_elem, "ident").text = myid_data
+                ET.SubElement(psk_elem, "remote_ident").text = remote_gateway
+                ET.SubElement(psk_elem, "keyType").text = "PSK"
+                ET.SubElement(psk_elem, "Key").text = psk
+                ET.SubElement(psk_elem, "description")
+
+            # Create <local> and <remote> entries if using address identifiers.
+            # Check for supported identifier types for PSK. Supports 'address' for both,
+            # or 'peeraddress' for the peer, where the gateway IP is used as the identifier.
+            if myid_type == 'address' and peerid_type in ('address', 'peeraddress'):
+                # Determine the correct peer identifier.
+                # If peerid_type is 'peeraddress', use the remote-gateway IP.
+                # Otherwise, use the explicitly defined peerid_data.
+                actual_peerid_data = remote_gateway if peerid_type == 'peeraddress' else peerid_data
+
+                local_uuid = str(uuid.uuid4())
+                local_elem = ET.SubElement(locals_elem, "local", {"uuid": local_uuid})
+                ET.SubElement(local_elem, "enabled").text = '1'
+                ET.SubElement(local_elem, "connection").text = conn_uuid
+                ET.SubElement(local_elem, "round").text = '0'
+                ET.SubElement(local_elem, "auth").text = 'psk'
+                ET.SubElement(local_elem, "id").text = myid_data
+                ET.SubElement(local_elem, "eap_id")
+                ET.SubElement(local_elem, "certs")
+                ET.SubElement(local_elem, "pubkeys")
+                ET.SubElement(local_elem, "description")
+
+                remote_uuid = str(uuid.uuid4())
+                remote_elem = ET.SubElement(remotes_elem, "remote", {"uuid": remote_uuid})
+                ET.SubElement(remote_elem, "enabled").text = '1'
+                ET.SubElement(remote_elem, "connection").text = conn_uuid
+                ET.SubElement(remote_elem, "round").text = '0'
+                ET.SubElement(remote_elem, "auth").text = 'psk'
+                ET.SubElement(remote_elem, "id").text = actual_peerid_data
+                ET.SubElement(remote_elem, "eap_id")
+                ET.SubElement(remote_elem, "groups")
+                ET.SubElement(remote_elem, "certs")
+                ET.SubElement(remote_elem, "cacerts")
+                ET.SubElement(remote_elem, "pubkeys")
+                ET.SubElement(remote_elem, "description")
+            else:
+                 print(f"  - WARNING: Phase 1 with ikeid {p1_ikeid} uses PSK, but identifier types ('{myid_type}', '{peerid_type}') are not a supported combination ('address'/'address' or 'address'/'peeraddress').")
+
         print(f"  - Phase 1 (ikeid: {p1_ikeid}) -> Connection (uuid: {conn_uuid}) converted.")
 
     print("\nStarting conversion of Phase 2 to <child>...")
@@ -196,7 +305,13 @@ def main():
         ET.SubElement(child, "reqid").text = get_text_from_element(p2, 'reqid')
         
         # Assembling the ESP proposals
-        p2_enc_algos = [get_text_from_element(opt, 'name') for opt in p2.findall('encryption-algorithm-option') if get_text_from_element(opt, 'name')]
+        p2_enc_algos = []
+        for opt in p2.findall('encryption-algorithm-option'):
+            name = get_text_from_element(opt, 'name')
+            keylen = get_text_from_element(opt, 'keylen')
+            if name:
+               p2_enc_algos.append(f"{name}{keylen}")
+
         p2_hash_algos = [clean_hash_name(opt.text) for opt in p2.findall('hash-algorithm-option') if opt.text]
         p2_pfs_group = map_dh_group_to_modp(get_text_from_element(p2, 'pfsgroup'))
 
@@ -214,14 +329,41 @@ def main():
         ET.SubElement(child, "mode").text = get_text_from_element(p2, 'mode')
         ET.SubElement(child, "policies").text = "1"
 
-        # convert local/remote subnets to CIDR
-        local_addr = get_text_from_element(p2, 'localid/address')
-        local_bits = get_text_from_element(p2, 'localid/netbits')
-        ET.SubElement(child, "local_ts").text = f"{local_addr}/{local_bits}" if local_addr and local_bits else ""
+        # Handle local traffic selector, resolving interface names to networks
+        localid_elem = p2.find('localid')
+        local_ts_text = ""
+        if localid_elem is not None:
+            id_type = get_text_from_element(localid_elem, 'type')
+            if id_type == 'network':
+                addr = get_text_from_element(localid_elem, 'address')
+                netbits = get_text_from_element(localid_elem, 'netbits')
+                if addr and netbits:
+                    local_ts_text = f"{addr}/{netbits}"
+            elif id_type: # Type is an interface name
+                cidr = get_interface_cidr(opnsense_root, id_type)
+                if cidr:
+                    local_ts_text = cidr
+                else:
+                    print(f"  - WARNING: Could not resolve interface '{id_type}' to a network for P2 uniqid {p2_uniqid}.")
+        ET.SubElement(child, "local_ts").text = local_ts_text
 
-        remote_addr = get_text_from_element(p2, 'remoteid/address')
-        remote_bits = get_text_from_element(p2, 'remoteid/netbits')
-        ET.SubElement(child, "remote_ts").text = f"{remote_addr}/{remote_bits}" if remote_addr and remote_bits else ""
+        # Handle remote traffic selector, resolving interface names to networks
+        remoteid_elem = p2.find('remoteid')
+        remote_ts_text = ""
+        if remoteid_elem is not None:
+            id_type = get_text_from_element(remoteid_elem, 'type')
+            if id_type == 'network':
+                addr = get_text_from_element(remoteid_elem, 'address')
+                netbits = get_text_from_element(remoteid_elem, 'netbits')
+                if addr and netbits:
+                    remote_ts_text = f"{addr}/{netbits}"
+            elif id_type: # Type is an interface name
+                cidr = get_interface_cidr(opnsense_root, id_type)
+                if cidr:
+                    remote_ts_text = cidr
+                else:
+                    print(f"  - WARNING: Could not resolve interface '{id_type}' to a network for P2 uniqid {p2_uniqid}.")
+        ET.SubElement(child, "remote_ts").text = remote_ts_text
         
         ET.SubElement(child, "rekey_time").text = get_text_from_element(p2, 'lifetime')
         ET.SubElement(child, "description").text = get_text_from_element(p2, 'descr')
@@ -243,24 +385,52 @@ def main():
 
     print("\nConversion complete.")
 
+    final_content = original_xml_content
+
+    # First, handle the <preSharedKeys> block update via targeted regex replacement.
+    if list(pre_shared_keys_elem):  # Check if any keys were actually added
+        print("Found pre-shared keys to migrate. Updating <preSharedKeys> block.")
+        ET.indent(pre_shared_keys_elem, space="  ", level=2) # Indent relative to <IPsec> parent
+        new_psk_block_str = ET.tostring(pre_shared_keys_elem, encoding='unicode', short_empty_elements=True)
+
+        psk_pattern = re.compile(r"<preSharedKeys\b[^>]*>(?:(?!</preSharedKeys>)[\s\S])*</preSharedKeys>|<preSharedKeys\s*/>")
+
+        # Use a lambda function for replacement to preserve indentation of the block itself.
+        def replace_psk(match):
+            original_block = match.group(0)
+            line_start_pos = final_content.rfind('\n', 0, match.start()) + 1
+            indentation = final_content[line_start_pos:match.start()]
+
+            new_block_lines = new_psk_block_str.splitlines()
+            if new_block_lines:
+                first_line = new_block_lines[0]
+                indented_subsequent_lines = [f"{indentation}{line}" for line in new_block_lines[1:]]
+                return "\n".join([first_line] + indented_subsequent_lines)
+            return ""
+
+        if psk_pattern.search(final_content):
+            final_content = psk_pattern.sub(replace_psk, final_content, count=1)
+            print("  - Successfully replaced existing <preSharedKeys> block.")
+        else:
+            print("  - WARNING: Could not find a <preSharedKeys> block or tag in <IPsec> to replace.")
+
+    # Second, handle the <Swanctl> block, operating on the already modified content.
     final_swanctl_element = opnsense_root.find('Swanctl')
     if final_swanctl_element is not None:
-        
         # Format the new Swanctl element internally using the reliable ET.indent function.
         ET.indent(final_swanctl_element, space="  ", level=0)
-        
         # Convert the formatted element to a clean string, using self-closing tags for empty elements.
         new_swanctl_block_str = ET.tostring(final_swanctl_element, encoding='unicode', short_empty_elements=True)
 
-        final_content = ""
+        current_content_for_swanctl = final_content
         swanctl_pattern = re.compile(r"<Swanctl.*?>.*?</Swanctl>", re.DOTALL)
-        match = swanctl_pattern.search(original_xml_content)
+        match = swanctl_pattern.search(current_content_for_swanctl)
 
         if match:
             print("Found existing <Swanctl> block. Replacing it.")
             block_start, block_end = match.start(), match.end()
-            line_start_pos = original_xml_content.rfind('\n', 0, block_start) + 1
-            indentation = original_xml_content[line_start_pos:block_start]
+            line_start_pos = current_content_for_swanctl.rfind('\n', 0, block_start) + 1
+            indentation = current_content_for_swanctl[line_start_pos:block_start]
             
             new_block_lines = new_swanctl_block_str.splitlines()
             if new_block_lines:
@@ -271,34 +441,33 @@ def main():
                 # Rebuild the final block string.
                 final_new_block = "\n".join([first_line] + indented_subsequent_lines)
             else:
-                final_new_block = "" # Handle unlikely case of an empty block
+                final_new_block = ""
 
-            # Reconstruct the entire file by replacing the old block with the perfectly formatted new one.
-            final_content = original_xml_content[:block_start] + final_new_block + original_xml_content[block_end:]
+            final_content = current_content_for_swanctl[:block_start] + final_new_block + current_content_for_swanctl[block_end:]
             
         else:
             print("No existing <Swanctl> block found. Inserting new block after <ipsec>.")
             ipsec_pattern = re.compile(r"</ipsec>", re.DOTALL)
-            ipsec_match = ipsec_pattern.search(original_xml_content)
+            ipsec_match = ipsec_pattern.search(current_content_for_swanctl)
             if ipsec_match:
                 insertion_point = ipsec_match.end()
-                line_start_pos = original_xml_content.rfind('\n', 0, ipsec_match.start()) + 1
-                indentation = original_xml_content[line_start_pos:ipsec_match.start()]
-                
-                # This logic is correct: prepend indentation to ALL lines as we are on a new line.
+                line_start_pos = current_content_for_swanctl.rfind('\n', 0, ipsec_match.start()) + 1
+                indentation = current_content_for_swanctl[line_start_pos:ipsec_match.start()]
+
+                # Prepend indentation to ALL lines as we are on a new line.
                 indented_new_block = "".join([f"{indentation}{line}\n" for line in new_swanctl_block_str.splitlines()]).rstrip()
                 
-                final_content = original_xml_content[:insertion_point] + '\n' + indented_new_block + original_xml_content[insertion_point:]
+                final_content = current_content_for_swanctl[:insertion_point] + '\n' + indented_new_block + current_content_for_swanctl[insertion_point:]
             else:
                  print("  - Fallback: Could not find </ipsec>, inserting before </opnsense>.")
-                 insertion_point_fallback = original_xml_content.rfind('</opnsense>')
+                 insertion_point_fallback = current_content_for_swanctl.rfind('</opnsense>')
                  indentation = "  "
                  indented_fallback_block = "".join([f"{indentation}{line}\n" for line in new_swanctl_block_str.splitlines()]).rstrip()
 
                  final_content = (
-                    original_xml_content[:insertion_point_fallback]
+                    current_content_for_swanctl[:insertion_point_fallback]
                      + indented_fallback_block + "\n"
-                     + original_xml_content[insertion_point_fallback:]
+                     + current_content_for_swanctl[insertion_point_fallback:]
                  )
 
         print(f"Saving format-preserved configuration to '{OUTPUT_CONFIG_PATH}'...")
@@ -306,7 +475,7 @@ def main():
             f.write(final_content)
         print("Save successful.")
     else:
-        print("ERROR: Could not generate the <Swanctl> block.")
+        print("ERROR: Could not find or generate the <Swanctl> block.")
 
 if __name__ == '__main__':
     main()
