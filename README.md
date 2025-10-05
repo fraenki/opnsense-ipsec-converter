@@ -44,7 +44,7 @@ It is highly recommended to verify the results:
 $ diff -Naur config.old.xml config.new.xml
 ```
 
-If the configuration looks good, try to import the swanctl configuration section into OPNsense.
+If the configuration looks good, try to replace the existing OPNsense configuration with the new one.
 
 ## Contributing
 
