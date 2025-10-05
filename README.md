@@ -33,6 +33,8 @@ Starting conversion of Phase 2 to <child>...
   - Phase 2 (ikeid: 3, uniqid: 5d59cdb7a1d43) -> child (uuid: 6e0c0026-8125-4858-94b6-0ea59e5a0158) converted.
 
 Conversion complete.
+Found pre-shared keys to migrate. Updating <preSharedKeys> block.
+  - Successfully replaced existing <preSharedKeys> block.
 Found existing <Swanctl> block. Replacing it.
 Saving format-preserved configuration to 'config.new.xml'...
 Save successful.
