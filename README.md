@@ -44,7 +44,7 @@ It is highly recommended to verify the results:
 $ diff -Naur config.old.xml config.new.xml
 ```
 
-If the configuration looks good, try to replace the existing OPNsense configuration with the new one.
+If the configuration looks good, try to replace the existing OPNsense configuration with the new one. Then navigate to `VPN: IPsec: Connections` and verify that everything is properly configured. You should disable the legacy IPsec configuration (`VPN: IPsec: Tunnel Settings`) and afterwards enable/apply the new IPsec configuration.
 
 ## Contributing
 
