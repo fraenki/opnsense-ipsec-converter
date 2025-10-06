@@ -378,8 +378,7 @@ def main():
             ET.SubElement(spd, "connection_child").text = child_uuid
             ET.SubElement(spd, "source").text = spd_source
             ET.SubElement(spd, "destination")
-            ET.SubElement(spd, "description").text = f"SPD for child {child_uuid}"
-            print(f"    - SPD entry created for Child {child_uuid}.")
+            ET.SubElement(spd, "description")
 
         print(f"  - Phase 2 (ikeid: {p2_ikeid}, uniqid: {p2_uniqid}) -> child (uuid: {child_uuid}) converted.")
 
